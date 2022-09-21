@@ -1,0 +1,274 @@
+#!/bin/bash -ue
+SCRIPT_DIR="$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )"
+JSON_FILE_SERVER_COUNTRIES="$SCRIPT_DIR/servers_countries.json"
+NORDVPN_SERVER_HOSTNAME="${NORDVPN_SERVER_HOSTNAME:-""}"
+NORDVPN_SERVER_COUNTRY="${NORDVPN_SERVER_COUNTRY:-"${1-}"}"
+NORDVPN_SERVER_CITY="${NORDVPN_SERVER_COUNTRY:-""}"
+NORDVPN_SERVER_GROUP="${NORDVPN_SERVER_GROUP:-"legacy_p2p"}"
+NORDVPN_VPN_PROTOCOL="${NORDVPN_VPN_PROTOCOL:-"wireguard_udp"}"
+NORDVPN_USE_ONLY_ONLINE_SERVERS="${NORDVPN_USE_ONLY_ONLINE_SERVERS:-"yes"}"
+NORDVPN_WIREGUARD_PRIVATE_KEY="${NORDVPN_WIREGUARD_PRIVATE_KEY:-""}"
+NORDVPN_WIREGUARD_IP_ADDRESS="${NORDVPN_WIREGUARD_IP_ADDRESS:-"10.5.0.2"}"
+NORDVPN_SERVER_WIREGUARD_PORT="${NORDVPN_SERVER_WIREGUARD_PORT:-"51820"}"
+NORDVPN_CLIENT_WIREGUARD_PORT="${NORDVPN_CLIENT_WIREGUARD_PORT:-"51820"}"
+NORDVPN_USERNAME="${NORDVPN_USERNAME:-""}"
+NORDVPN_PASSWORD="${NORDVPN_PASSWORD:-""}"
+WIREGUARD_ALLOWED_IPS="${WIREGUARD_ALLOWED_IPS:-"0.0.0.0/0"}"
+WIREGUARD_PERSISTANT_KEEPALIVE="${WIREGUARD_PERSISTANT_KEEPALIVE:-"25"}"
+WIREGUARD_DNS="${WIREGUARD_DNS:-"103.86.96.100, 103.86.99.100"}"
+WIREGUARD_CONFIG_FILE="${WIREGUARD_CONFIG_FILE:-"/config/wg0.conf"}"
+SERVER_SEARCH_LIMIT="${SERVER_SEARCH_LIMIT:-""}"
+SERVER_RECOMMENDATIONS_URL="https://api.nordvpn.com/v1/servers/recommendations"
+SERVER_STATS_URL="https://nordvpn.com/api/server/stats/"
+SERVER_COUNTRY_CODES_URL="https://nordvpn.com/wp-admin/admin-ajax.php?action=servers_countries"
+USER_INFO_FILE="$SCRIPT_DIR/user_info.json"
+JWT_FILE="$SCRIPT_DIR/access_token.json"
+
+trim() {
+  local var="$*"
+  # remove leading whitespace characters
+  var="${var#"${var%%[![:space:]]*}"}"
+  # remove trailing whitespace characters
+  var="${var%"${var##*[![:space:]]}"}"
+  printf '%s' "$var"
+}
+
+rawurlencode() {
+  local string="${1-}"; local strlen=${#string};
+  local encoded=""; local pos c o;
+
+  for (( pos=0 ; pos<strlen ; pos++ )); do
+    c="${string:$pos:1}"
+    case "$c" in
+      [-_.~a-zA-Z0-9]) o="${c}";;
+      * ) printf -v o '%%%02X' "'$c";;
+     esac
+     encoded+="${o}"
+  done
+  echo "${encoded}"
+}
+
+add_param() {
+  local QUERY="${3:-"?"}"
+  echo "${QUERY}&$(rawurlencode "${1-}")=$(rawurlencode "${2-}")"
+}
+
+[ -n "$NORDVPN_WIREGUARD_IP_ADDRESS" ] && NORDVPN_WIREGUARD_IP_ADDRESS="$(trim "$NORDVPN_WIREGUARD_IP_ADDRESS")"
+if ! [[ "$NORDVPN_WIREGUARD_IP_ADDRESS" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+  NORDVPN_WIREGUARD_IP_ADDRESS="$(ip -j a | jq -r '.[] |select((.ifname|test("wg0";"i")) or (.ifname|test("nordlynx";"i")) or (.ifname|test("tun";"i")) ) | .addr_info[].local')"
+fi
+if [ -n "$NORDVPN_WIREGUARD_PRIVATE_KEY" ]; then
+  [ -f "$NORDVPN_WIREGUARD_PRIVATE_KEY" ] && NORDVPN_WIREGUARD_PRIVATE_KEY="$(cat "$NORDVPN_WIREGUARD_PRIVATE_KEY")"
+  NORDVPN_WIREGUARD_PRIVATE_KEY="$(trim "$NORDVPN_WIREGUARD_PRIVATE_KEY")"
+fi
+if [ ! -n "$NORDVPN_WIREGUARD_PRIVATE_KEY" ]; then
+  # Lookup our wireguard private key from the interface if it exists
+  NORDVPN_WIREGUARD_PRIVATE_KEY="$(wg show 'nordlynx' private-key 2>/dev/null || true)"
+  if [ ! -n "$NORDVPN_WIREGUARD_PRIVATE_KEY" ]; then
+    # Okay last effort is to login and grab the private key
+    if [ -z "$NORDVPN_USERNAME" -o -z "$NORDVPN_PASSWORD" ]; then
+      echo >&2 "ERROR: NORDVPN_WIREGUARD_PRIVATE_KEY not set and NORDVPN_USERNAME & NORDVPN_PASSWORD not set so we cannot lookup the private key"; exit 100
+    fi
+    if [ ! -f "$JWT_FILE" -o "$(jq -e '.' "$JWT_FILE" >/dev/null 2>&1; echo $?)" -gt 0 ]; then
+      rm -f "$JWT_FILE"
+      echo >&2 "Could not find JWT access token getting a new one"
+      HTTP_RESP_CODE=$(curl -s -X POST \
+       -o "response.txt" -w '%{http_code}' \
+       -H 'Content-Type: application/json' \
+       -d "$(jo -- -s username="$USERNAME" -s password="$PASSWORD")" \
+       "https://api.nordvpn.com/v1/users/tokens") || { echo >&2 "ERROR: request timed out"; exit 100; }
+      HTTP_RESP="$(cat "response.txt" 2>/dev/null)"; rm -f "response.txt"
+      if [ "$HTTP_RESP_CODE" -eq 200 ]; then
+        echo "Successfully logged in"
+      elif [ "$HTTP_RESP_CODE" -eq "429" ]; then
+        echo >&2 "ERROR: 429: Too Many Requests!"; exit 100
+      elif [ "$HTTP_RESP_CODE" -lt 200 -o "$HTTP_RESP_CODE" -gt "299" ]; then
+        echo >&2 "ERROR: got response code $HTTP_RESP_CODE"
+        echo >&2 "$HTTP_RESP"; exit 100
+      elif [ -z "$HTTP_RESP_CODE" ]; then
+        echo >&2 "ERROR: did not get any response from server"; exit 100
+      fi
+      echo "$HTTP_RESP" >"$JWT_FILE"
+      JWT="$HTTP_RESP"
+    else
+      echo >&2 "Using existing JWT access token"
+      JWT="$(cat "$JWT_FILE")"
+    fi
+    LOGIN_EXPIRES_AT="$(echo "$JWT" | jq -r '.expires_at')"
+    EXPIRES_AT_TIMESTAMP="$(date -u --date "$LOGIN_EXPIRES_AT" "+%s")"
+    if [ "$(date -u "+%s")" -lt "$EXPIRES_AT_TIMESTAMP" ]; then
+      LOGIN_TOKEN="$(echo "$JWT" | jq -r '.token')"
+      echo "Found existing login token for user"
+    else
+      RENEW_TOKEN="$(echo "$JWT" | jq -r '.renew_token')"
+      HTTP_RESP_CODE="$(curl -s -X POST \
+        -o "response.txt" -w '%{http_code}' \
+        -H 'Content-Type: application/json' \
+        -d "$(jo -- -s renewToken="$RENEW_TOKEN")" \
+        "https://api.nordvpn.com/v1/users/tokens/renew")"
+      HTTP_RESP="$(cat "response.txt" 2>/dev/null)"; rm -f "response.txt"
+      if [ "$HTTP_RESP_CODE" -eq 200 ]; then
+        echo "Successfully renewed login token for user"
+      elif [ "$HTTP_RESP_CODE" -eq "429" ]; then
+        echo >&2 "ERROR: 429: Too Many Requests!"; exit 100
+      elif [ "$HTTP_RESP_CODE" -lt 200 -o "$HTTP_RESP_CODE" -gt "299" ]; then
+        echo >&2 "ERROR: got response code $HTTP_RESP_CODE"
+        echo >&2 "$HTTP_RESP"; exit 100
+      elif [ -z "$HTTP_RESP_CODE" ]; then
+        echo >&2 "ERROR: did not get any response from server"; exit 100
+      fi
+      echo "$HTTP_RESP" >"$JWT_FILE"
+      JWT="$HTTP_RESP"
+    fi
+    if [ ! -f "$USER_INFO_FILE" -o "$(jq -e '.' "$USER_INFO_FILE" >/dev/null 2>&1; echo $?)" -gt 0 ]; then
+      HTTP_RESP_CODE=$(curl -s -X GET \
+        -o "response.txt" -w '%{http_code}' \
+        -H 'Content-Type: application/json' \
+        -H "Authorization: token:$LOGIN_TOKEN" \
+        "https://api.nordvpn.com/v1/users/services/credentials") || { echo >&2 "ERROR: request timed out"; exit 100; }
+      HTTP_RESP="$(cat "response.txt" 2>/dev/null)"; rm -f "response.txt"
+      if [ "$HTTP_RESP_CODE" -eq 200 ]; then
+        echo "Successfully got user info"
+      elif [ "$HTTP_RESP_CODE" -eq "429" ]; then
+        echo >&2 "ERROR: 429: Too Many Requests!"; exit 100
+      elif [ "$HTTP_RESP_CODE" -lt 200 -o "$HTTP_RESP_CODE" -gt "299" ]; then
+        echo >&2 "ERROR: got response code $HTTP_RESP_CODE"
+        echo >&2 "$HTTP_RESP"; exit 100
+      elif [ -z "$HTTP_RESP_CODE" ]; then
+        echo >&2 "ERROR: did not get any response from server"; exit 100
+      fi
+      echo "$HTTP_RESP" >"$USER_INFO_FILE"
+      USER_INFO="$HTTP_RESP"
+    else
+      USER_INFO="$(cat "$USER_INFO_FILE")"
+    fi
+    NORDVPN_WIREGUARD_PRIVATE_KEY="$(jq -r '.nordlynx_private_key' "$USER_INFO_FILE")"
+    [ -n "$NORDVPN_WIREGUARD_PRIVATE_KEY" ] && echo >&2 "Grabbed user Wireguard Private Key"
+  fi
+fi
+[ -n "$NORDVPN_WIREGUARD_PRIVATE_KEY" ] || { echo >&2 "ERROR: must pass NordVPN private key with NORDVPN_WIREGUARD_PRIVATE_KEY"; exit 255; }
+[ -n "$NORDVPN_WIREGUARD_IP_ADDRESS" ] || { echo >&2 "ERROR: must pass NordVPN IP address with NORDVPN_WIREGUARD_IP_ADDRESS"; exit 255; }
+
+[ "$SERVER_SEARCH_LIMIT" == "0" ] && SERVER_SEARCH_LIMIT="1"
+[ -n "$NORDVPN_SERVER_COUNTRY" ] && NORDVPN_SERVER_COUNTRY="$(echo "$NORDVPN_SERVER_COUNTRY" | awk '{gsub(/[-_]+/," ")}1' | awk '{for (i=1; i<=NF; ++i) { $i=toupper(substr($i,1,1)) tolower(substr($i,2)); } print }')"
+[ -n "$NORDVPN_SERVER_CITY" ] && NORDVPN_SERVER_CITY="$(echo "$NORDVPN_SERVER_CITY" | awk '{gsub(/[-_]+/," ")}1' | awk '{for (i=1; i<=NF; ++i) { $i=toupper(substr($i,1,1)) tolower(substr($i,2)); } print }')"
+[ -n "$NORDVPN_VPN_PROTOCOL" ] && NORDVPN_VPN_PROTOCOL="$(echo "$NORDVPN_VPN_PROTOCOL" | tr '[:upper:]' '[:lower:]')"
+
+# Check for valid VPN protocol
+case "$NORDVPN_VPN_PROTOCOL" in
+  'ikev2'|'openvpn_udp'|'openvpn_tcp'|'proxy_ssl'|'proxy_ssl_cybersec'|'wireguard_udp') ;;
+  *) echo >&2 "ERROR: invalid VPN protocol: '$NORDVPN_VPN_PROTOCOL'"; exit 255;;
+esac
+
+# If no server was set, choose the best
+if [ -z "$NORDVPN_SERVER_HOSTNAME" ]; then
+  echo "INFO: VPN hostname has not been set, automatically selecting server."
+  if [ -z "$NORDVPN_SERVER_COUNTRY" ]; then
+    echo "INFO: VPN country has not been set. The default will be picked by NordVPN API"
+    #GET fastest server based on NordVPN API
+    #https://api.nordvpn.com/v1/servers/recommendations
+  else
+    #Country codes will only be fetched once. You can force to get a new list to start a new container
+    #This will speed up the process
+    if [ ! -f "$JSON_FILE_SERVER_COUNTRIES" -o "$(jq 'length' "$JSON_FILE_SERVER_COUNTRIES" 2>/dev/null)" == "0" ]; then
+      echo "INFO: Country codes JSON is not found downloading now ..."
+      curl -s "$SERVER_COUNTRY_CODES_URL" -o "$JSON_FILE_SERVER_COUNTRIES"
+    else
+      echo "INFO: Found existing country codes list"
+    fi
+    # First lookup country by code
+    COUNTRY_JSON="$(jq --arg code "${NORDVPN_SERVER_COUNTRY^^}" '.[] | select(.code == $code)' "$JSON_FILE_SERVER_COUNTRIES")"
+    # If empty lookup country by name
+    [ -z "$COUNTRY_JSON" -o "$COUNTRY_JSON" == "[]" ] && COUNTRY_JSON="$(jq --arg name "$NORDVPN_SERVER_COUNTRY" '.[] | select(.name == $name)' "$JSON_FILE_SERVER_COUNTRIES")"
+    # If empty lookup country by id
+    [ -z "$COUNTRY_JSON" -o "$COUNTRY_JSON" == "[]" ] && COUNTRY_JSON="$(jq --arg id "$NORDVPN_SERVER_COUNTRY" '.[] | select(.id == $id)' "$JSON_FILE_SERVER_COUNTRIES")"
+    [ -z "$COUNTRY_JSON" -o "$COUNTRY_JSON" == "[]" ] && { echo >&2 "ERROR: Cannot find country with name, code or id '$NORDVPN_SERVER_COUNTRY'"; exit 101; }
+
+    COUNTRY_CODE="$(echo "$COUNTRY_JSON" | jq -r '.code')"
+    COUNTRY_ID="$(echo "$COUNTRY_JSON" | jq -r '.id')"
+    SERVER_COUNTRY_NAME="$(echo "$COUNTRY_JSON" | jq -r '.name')"
+    echo "INFO: Looking up servers from Country: $SERVER_COUNTRY_NAME"
+    QUERY_PARAM="$(add_param "filters[country_id]" "$COUNTRY_ID" "${QUERY_PARAM-}")"
+  fi
+
+  if [ -n "$NORDVPN_SERVER_GROUP" ]; then
+    QUERY_PARAM="$(add_param "filters[groups][identifier]" "$NORDVPN_SERVER_GROUP" "${QUERY_PARAM-}")"
+  fi
+  # Set filter based on the correct protocol
+  QUERY_PARAM="$(add_param "filters[servers_technologies][identifier]" "$NORDVPN_VPN_PROTOCOL" "${QUERY_PARAM-}")"
+  if [ "$NORDVPN_USE_ONLY_ONLINE_SERVERS" == "yes" -o "$NORDVPN_USE_ONLY_ONLINE_SERVERS" == "true" ]; then
+    # Make sure the server is online
+    QUERY_PARAM="$(add_param "filters[status]" "online" "${QUERY_PARAM-}")"
+    QUERY_PARAM="$(add_param "filters[servers_technologies][pivot]" "online" "${QUERY_PARAM-}")"
+  fi
+  # Set a limit of results
+  [ -n "${SERVER_SEARCH_LIMIT-}" ] && QUERY_PARAM="$(add_param "limit" "$SERVER_SEARCH_LIMIT" "$QUERY_PARAM")"
+
+  #echo "${SERVER_RECOMMENDATIONS_URL}${QUERY_PARAM}"
+
+  #GET fastest server based on COUNTRY
+  #https://api.nordvpn.com/v1/servers/recommendations?limit=10&filters=[country_id]=106
+  JSON_FILE="$(mktemp /tmp/output.XXXXXXXXXX)" || { echo "Failed to create temp file"; exit 200; }
+  curl -s "${SERVER_RECOMMENDATIONS_URL}${QUERY_PARAM}" -o "$JSON_FILE"
+  SERVER_JSON="$(cat "$JSON_FILE")"; rm -f "$JSON_FILE"
+
+  NUMBER_OF_SERVERS="$(echo "$SERVER_JSON" | jq 'length' 2>/dev/null || echo -n "0")"
+  [ "$NUMBER_OF_SERVERS" -gt 0 ] || { echo >&2 "ERROR: cannot find any servers"; exit 100; }
+  DESIRED_SERVER_NUMBER="$(shuf -i 0-$((NUMBER_OF_SERVERS-1)) -n 1)"
+
+  [ -n "${SERVER_CITY-}" ] || SERVER_CITY="$(echo "$SERVER_JSON" | jq -r --argjson i "$DESIRED_SERVER_NUMBER" '.[$i].locations[0].country.city.name')"
+  [ -n "${SERVER_COUNTRY_NAME-}" ] || SERVER_COUNTRY_NAME="$(echo "$SERVER_JSON" | jq -r --argjson i "$DESIRED_SERVER_NUMBER" '.[$i].locations[0].country.name')"
+  NORDVPN_SERVER_HOSTNAME="$(echo "$SERVER_JSON" | jq -r --argjson i "$DESIRED_SERVER_NUMBER" '.[$i].hostname')"
+  SERVER_NAME="$(echo "$SERVER_JSON" | jq -r --argjson i "$DESIRED_SERVER_NUMBER" '.[$i].name')"
+  SERVER_LOAD="$(echo "$SERVER_JSON" | jq -r --argjson i "$DESIRED_SERVER_NUMBER" '.[$i].load')"
+  SERVER_UPDATED_AT="$(echo "$SERVER_JSON" | jq -r --argjson i "$DESIRED_SERVER_NUMBER" '.[$i].updated_at')"
+  SERVER_IP="$(echo "$SERVER_JSON" | jq -r --argjson i "$DESIRED_SERVER_NUMBER" '.[$i].station')"
+
+  case "$NORDVPN_VPN_PROTOCOL" in
+    'ikev2') ;;
+    'openvpn_udp') ;;
+    'openvpn_tcp') ;;
+    'proxy_ssl') ;;
+    'proxy_ssl_cybersec') ;;
+    'wireguard_udp')
+      WIREGUARD_PUBLIC_KEY="$(echo "$SERVER_JSON" | jq -r --argjson i "$DESIRED_SERVER_NUMBER" '.[$i].technologies[] | select(.identifier == "wireguard_udp") | .metadata[] | select(.name == "public_key") | .value')"
+    ;;
+  esac
+# Otherwise, use the server that was specified
+else
+  echo "INFO: SERVER has been set to ${NORDVPN_SERVER_HOSTNAME}"
+  SERVER_JSON="$(curl -s "https://api.nordvpn.com/server" | jq --arg domain "$NORDVPN_SERVER_HOSTNAME" '.[] | select(.domain == $domain)')"
+
+  #Set vars
+  export SERVER_NAME="$(echo "$SERVER_JSON" | jq -r '.name')"
+  export SERVER_LOAD="$(curl -s "${SERVER_STATS_URL}${NORDVPN_SERVER_HOSTNAME}" | jq -r '.[]')"
+  export SERVER_UPDATED_AT=""
+  export SERVER_IP="$(echo "$SERVER_JSON" | jq -r '.ip_address')"
+fi
+echo "Server Name: $SERVER_NAME"
+echo "Server Hostname: $NORDVPN_SERVER_HOSTNAME"
+echo "Server Country: $SERVER_COUNTRY_NAME"
+echo "Server City: $SERVER_CITY"
+echo "Server IP: $SERVER_IP"
+echo "Server Load: ${SERVER_LOAD}%"
+[ -n "$WIREGUARD_PUBLIC_KEY" ] && echo "Server Wireguard Public Key: $WIREGUARD_PUBLIC_KEY"
+echo "Updated At: $SERVER_UPDATED_AT"
+
+if [ -n "$WIREGUARD_PUBLIC_KEY" ]; then
+  mkdir -p "$(dirname "$WIREGUARD_CONFIG_FILE")"
+  cat >"$WIREGUARD_CONFIG_FILE" <<-EOF
+[Interface]
+ListenPort = $NORDVPN_CLIENT_WIREGUARD_PORT
+PrivateKey = $NORDVPN_WIREGUARD_PRIVATE_KEY
+Address = $NORDVPN_WIREGUARD_IP_ADDRESS/32
+EOF
+  [ -n "$WIREGUARD_DNS" ] && echo "DNS = $WIREGUARD_DNS" >>"$WIREGUARD_CONFIG_FILE"
+  cat >>"$WIREGUARD_CONFIG_FILE" <<-EOF
+
+[Peer]
+PublicKey = $WIREGUARD_PUBLIC_KEY
+AllowedIPs = $WIREGUARD_ALLOWED_IPS
+Endpoint = ${SERVER_IP}:${NORDVPN_SERVER_WIREGUARD_PORT}
+EOF
+  [ -n "$WIREGUARD_PERSISTANT_KEEPALIVE" ] && echo "PersistentKeepalive = $WIREGUARD_PERSISTANT_KEEPALIVE" >>"$WIREGUARD_CONFIG_FILE"
+fi
